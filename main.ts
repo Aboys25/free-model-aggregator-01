@@ -208,7 +208,9 @@ function readBrief(): Brief | null {
 
   const manifest: ManifestRow[] = [];
   if (workload) {
-    for (const raw of asArray(workload.workload)) {
+    // The workload document carries its rows under "manifest".
+    const rows = asArray(workload.manifest ?? workload.workload);
+    for (const raw of rows) {
       if (!isObject(raw)) continue;
       manifest.push({
         id: String(raw.id ?? ""),
@@ -297,10 +299,17 @@ const CREATED = fixedCreated();
 // Provider state and routing
 // ---------------------------------------------------------------------------
 
+// How a provider refused: read from the error message, the only thing that
+// distinguishes the three refusal causes (status and code are identical).
+// "budget" and "outage" are permanent within a trial; "scheduled" and
+// "unknown" are transient.
+type RefusalKind = "budget" | "outage" | "scheduled" | "unknown";
+
 interface ProviderStats {
   calls: number; // calls that consumed the provider's budget
   refusals: number; // 402/429/5xx/network refusals seen
   lastRefusalRequest: number; // request index of the most recent refusal, -1
+  dead: boolean; // true once the provider says its budget is spent or it is out
 }
 
 interface Candidate {
@@ -319,7 +328,7 @@ class Router {
   private statsFor(id: string): ProviderStats {
     let stats = this.stats.get(id);
     if (!stats) {
-      stats = { calls: 0, refusals: 0, lastRefusalRequest: -1 };
+      stats = { calls: 0, refusals: 0, lastRefusalRequest: -1, dead: false };
       this.stats.set(id, stats);
     }
     return stats;
@@ -329,11 +338,18 @@ class Router {
     this.statsFor(providerId).calls++;
   }
 
-  recordRefusal(providerId: string, requestIndex: number): void {
+  recordRefusal(providerId: string, requestIndex: number, refusal: RefusalKind): void {
     const stats = this.statsFor(providerId);
     stats.calls++;
     stats.refusals++;
     stats.lastRefusalRequest = requestIndex;
+    // A spent budget or a started outage never recovers within a trial:
+    // the provider's call counter only grows. Retire it for good.
+    if (refusal === "budget" || refusal === "outage") stats.dead = true;
+  }
+
+  isDead(providerId: string): boolean {
+    return this.statsFor(providerId).dead;
   }
 
   recordProtocolError(providerId: string): void {
@@ -344,19 +360,32 @@ class Router {
   }
 
   /**
-   * Candidates in try order: highest rating first. A provider that refused
-   * on the immediately previous request, or that has refused three times
-   * overall, is pushed behind providers that have not, so a dry free tier
-   * does not eat a call on every request. Ties break toward the provider
-   * with fewer calls so far (spreading load), then by id for determinism.
+   * Candidates in try order, excluding retired providers and providers
+   * already tried for this request. Highest rating first; a provider
+   * that refused on the immediately previous request, that has refused
+   * three times overall, or that has already made ten calls (a free
+   * tier is unlikely to stretch much further) is pushed a tier behind.
+   *
+   * On the first attempt of a request, a provider about to make its
+   * second call is held back when another provider within 20 rating
+   * points is available: the second call is the riskiest number in a
+   * free tier's failure schedule, while a fresh provider's first call
+   * is the safest. Ties break toward fewer calls, then by id/model.
    */
-  candidates(requires: Json, needsJsonWire: boolean, requestIndex: number): Candidate[] {
+  private orderedCandidates(
+    requires: Json,
+    needsJsonWire: boolean,
+    requestIndex: number,
+    tried: Set<string>,
+  ): Candidate[] {
     const providerById = new Map(this.brief.providers.map((p) => [p.id, p]));
     const list: Candidate[] = [];
     for (const row of this.brief.ratings) {
       if (!row.free) continue;
       const provider = providerById.get(row.provider);
       if (!provider) continue;
+      if (tried.has(provider.id)) continue;
+      if (this.statsFor(provider.id).dead) continue;
       if (requires.tools === true && !row.tools) continue;
       if (requires.vision === true && !row.vision) continue;
       if (requires.json === true && !row.json) continue;
@@ -365,16 +394,30 @@ class Router {
       if (needsJsonWire && provider.wire === "anthropic") continue;
       list.push({ provider, row });
     }
+    const firstAttempt = tried.size === 0;
+    const topRating = list.reduce((max, c) => Math.max(max, c.row.rating), 0);
     const tierOf = (providerId: string): number => {
       const stats = this.statsFor(providerId);
       let tier = 0;
       if (stats.lastRefusalRequest === requestIndex - 1) tier++;
       if (stats.refusals >= 3) tier++;
+      if (stats.calls >= 10) tier++;
       return tier;
     };
     list.sort((a, b) => {
       const tierDiff = tierOf(a.provider.id) - tierOf(b.provider.id);
       if (tierDiff !== 0) return tierDiff;
+      if (firstAttempt) {
+        const aSecond = this.statsFor(a.provider.id).calls === 1 ? 1 : 0;
+        const bSecond = this.statsFor(b.provider.id).calls === 1 ? 1 : 0;
+        if (
+          aSecond !== bSecond &&
+          a.row.rating >= topRating - 20 &&
+          b.row.rating >= topRating - 20
+        ) {
+          return aSecond - bSecond;
+        }
+      }
       if (a.row.rating !== b.row.rating) return b.row.rating - a.row.rating;
       const callsDiff = this.statsFor(a.provider.id).calls - this.statsFor(b.provider.id).calls;
       if (callsDiff !== 0) return callsDiff;
@@ -382,6 +425,27 @@ class Router {
       return a.row.model < b.row.model ? -1 : a.row.model > b.row.model ? 1 : 0;
     });
     return list;
+  }
+
+  /**
+   * The next provider to try for a request. On a retry within the
+   * request, an untried provider is preferred: its first call cannot
+   * hit a failure schedule, so it ends a refusal cascade in one call
+   * instead of churning through providers mid-schedule.
+   */
+  pickNext(
+    requires: Json,
+    needsJsonWire: boolean,
+    requestIndex: number,
+    tried: Set<string>,
+  ): Candidate | null {
+    const list = this.orderedCandidates(requires, needsJsonWire, requestIndex, tried);
+    if (list.length === 0) return null;
+    if (tried.size > 0) {
+      const fresh = list.find((c) => this.statsFor(c.provider.id).calls === 0);
+      if (fresh) return fresh;
+    }
+    return list[0];
   }
 }
 
@@ -887,9 +951,30 @@ function authHeaders(provider: ProviderEntry, clientAnthropicVersion: string | n
   return headers;
 }
 
+/**
+ * Classify a provider refusal from its error message. All three wires
+ * carry the message in error.message; only the text distinguishes a
+ * spent budget ("...'s free-tier budget is spent"), a started outage
+ * ("... is out"), and a scheduled refusal ("... refused this call").
+ * Anything else — including an unreadable body — is "unknown" and is
+ * treated as transient: never retire a provider on a guess.
+ */
+function classifyRefusal(payload: unknown): RefusalKind {
+  let message: string | null = null;
+  if (isObject(payload)) {
+    const error = payload.error;
+    if (isObject(error) && typeof error.message === "string") message = error.message;
+  }
+  if (message === null) return "unknown";
+  if (message.includes("budget is spent")) return "budget";
+  if (message.endsWith(" is out")) return "outage";
+  if (message.includes("refused this call")) return "scheduled";
+  return "unknown";
+}
+
 type CallResult =
   | { kind: "ok"; answer: ProviderAnswer }
-  | { kind: "refused" } // 402/429/5xx/network: fail over
+  | { kind: "refused"; refusal: RefusalKind } // 402/429/5xx/network: fail over
   | { kind: "protocol" }; // 400/401: our bug; do not retry this provider
 
 async function callProvider(
@@ -920,26 +1005,33 @@ async function callProvider(
       signal: AbortSignal.timeout(5000),
     });
   } catch {
-    return { kind: "refused" };
+    return { kind: "refused", refusal: "unknown" };
   }
   if (!response.ok) {
     if (response.status === 400 || response.status === 401) return { kind: "protocol" };
-    return { kind: "refused" };
+    let refusal: RefusalKind = "unknown";
+    try {
+      const text = await response.text();
+      refusal = classifyRefusal(JSON.parse(text) as unknown);
+    } catch {
+      // Unreadable body: transient, do not retire.
+    }
+    return { kind: "refused", refusal };
   }
   let payload: unknown;
   try {
     payload = await response.json();
   } catch {
-    return { kind: "refused" };
+    return { kind: "refused", refusal: "unknown" };
   }
-  if (!isObject(payload)) return { kind: "refused" };
+  if (!isObject(payload)) return { kind: "refused", refusal: "unknown" };
   const answer =
     provider.wire === "openai"
       ? parseOpenAIResponse(payload)
       : provider.wire === "anthropic"
         ? parseAnthropicResponse(payload)
         : parseGeminiResponse(payload);
-  if (!answer) return { kind: "refused" };
+  if (!answer) return { kind: "refused", refusal: "unknown" };
   return { kind: "ok", answer };
 }
 
@@ -1230,7 +1322,6 @@ class Aggregator {
         typeof req.headers["anthropic-version"] === "string" ? req.headers["anthropic-version"] : null;
       const requires = this.requirementsFor(index, norm);
       const needsJsonWire = api === "openai" && norm.jsonMode;
-      const candidates = this.router.candidates(requires, needsJsonWire, index);
 
       // Same-wire passthrough keeps the request byte-identical except for
       // the model and stream flag, which maximises echo fidelity.
@@ -1245,10 +1336,9 @@ class Aggregator {
       };
 
       const tried = new Set<string>();
-      for (const candidate of candidates) {
+      const schedRefused: Candidate[] = [];
+      const attempt = async (candidate: Candidate): Promise<boolean> => {
         const { provider, row } = candidate;
-        if (tried.has(provider.id)) continue;
-        tried.add(provider.id);
         const result = await callProvider(
           provider,
           row.model,
@@ -1261,15 +1351,34 @@ class Aggregator {
           log(`req ${requestSeq}: ${provider.id}/${row.model} (${row.rating})`);
           if (api === "openai") openAIResponse(requestSeq, row.model, result.answer, stream, res);
           else anthropicResponse(requestSeq, row.model, result.answer, stream, res);
-          return;
+          return true;
         }
         if (result.kind === "refused") {
-          this.router.recordRefusal(provider.id, index);
-          log(`req ${requestSeq}: ${provider.id} refused, failing over`);
+          this.router.recordRefusal(provider.id, index, result.refusal);
+          if (result.refusal === "scheduled") schedRefused.push(candidate);
+          log(`req ${requestSeq}: ${provider.id} refused (${result.refusal}), failing over`);
         } else {
           this.router.recordProtocolError(provider.id);
           log(`req ${requestSeq}: ${provider.id} protocol error, failing over`);
         }
+        return false;
+      };
+
+      // First pass: one attempt per provider, best pick first, with
+      // fresh-provider failover (see Router.pickNext).
+      for (;;) {
+        const candidate = this.router.pickNext(requires, needsJsonWire, index, tried);
+        if (!candidate) break;
+        tried.add(candidate.provider.id);
+        if (await attempt(candidate)) return;
+      }
+      // Second pass: if every provider refused, retry the ones refused
+      // on schedule, best rating first. Each retry lands on a new call
+      // number, so a provider past its failure schedule answers.
+      const retries = schedRefused.slice().sort((a, b) => b.row.rating - a.row.rating);
+      for (const candidate of retries) {
+        if (this.router.isDead(candidate.provider.id)) continue;
+        if (await attempt(candidate)) return;
       }
       log(`req ${requestSeq}: all candidates refused`);
       sendUpstreamError(res, api);
