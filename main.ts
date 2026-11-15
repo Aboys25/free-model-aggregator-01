@@ -79,7 +79,6 @@ function blocksText(content: unknown): string {
 
 interface ProviderEntry {
   id: string;
-  name: string;
   wire: "openai" | "anthropic" | "gemini";
   auth: string;
   keyEnv: string;
@@ -99,10 +98,6 @@ interface RatingRow {
 }
 
 interface ManifestRow {
-  id: string;
-  api: string;
-  stream: boolean;
-  weight: number;
   requires: Json;
 }
 
@@ -179,7 +174,6 @@ function readBrief(): Brief | null {
         asString(raw.path) ?? asString(raw.base_path) ?? asString(raw.base_url) ?? asString(raw.base) ?? "";
       providers.push({
         id: String(raw.id ?? ""),
-        name: String(raw.name ?? raw.id ?? ""),
         wire,
         auth: String(raw.auth ?? ""),
         keyEnv: String(raw.key_env ?? ""),
@@ -213,10 +207,6 @@ function readBrief(): Brief | null {
     for (const raw of rows) {
       if (!isObject(raw)) continue;
       manifest.push({
-        id: String(raw.id ?? ""),
-        api: String(raw.api ?? ""),
-        stream: raw.stream === true,
-        weight: asNumber(raw.weight) ?? 1,
         requires: isObject(raw.requires) ? raw.requires : {},
       });
     }
@@ -470,6 +460,8 @@ interface NormMessage {
   parts: NormPart[];
   toolCalls?: { id: string; name: string; input: unknown }[];
   toolCallId?: string;
+  /** Function name for a tool result, when an earlier call named it. */
+  toolCallName?: string;
 }
 
 interface NormTool {
@@ -491,18 +483,34 @@ interface NormRequest {
   jsonSchema: unknown;
 }
 
+/** Guess a MIME type from a URL's extension; default image/png. */
+function mimeFromUrl(url: string): string {
+  const path = url.split(/[?#]/)[0];
+  const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "gif") return "image/gif";
+  if (ext === "webp") return "image/webp";
+  return "image/png";
+}
+
 function parseImageUrl(url: string): ImageRef {
-  const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(url);
-  if (match && match[2] === ";base64") {
-    return { kind: "data", mediaType: match[1] || "image/png", data: match[3] };
+  const match = /^data:([^,]*),([\s\S]*)$/.exec(url);
+  if (match) {
+    // Split the header on ";" so parameters (e.g. charset) between the
+    // media type and ";base64" no longer defeat data-URL detection.
+    const params = match[1].split(";");
+    if (params.includes("base64")) {
+      return { kind: "data", mediaType: params[0] || "image/png", data: match[2] };
+    }
   }
-  return { kind: "url", mediaType: "image/png", data: url };
+  return { kind: "url", mediaType: mimeFromUrl(url), data: url };
 }
 
 /** Normalize an OpenAI chat-completions body. */
 function normalizeOpenAI(body: Json): NormRequest {
   const systemParts: string[] = [];
   const messages: NormMessage[] = [];
+  const toolNames = new Map<string, string>();
   for (const raw of asArray(body.messages)) {
     if (!isObject(raw)) continue;
     const role = raw.role;
@@ -540,8 +548,13 @@ function normalizeOpenAI(body: Json): NormRequest {
       }
       toolCalls.push({ id: String(call.id ?? ""), name: String(call.function.name ?? ""), input });
     }
+    for (const call of toolCalls) {
+      if (call.id && call.name) toolNames.set(call.id, call.name);
+    }
     if (role === "tool") {
-      messages.push({ role: "tool", parts, toolCallId: String(raw.tool_call_id ?? "") });
+      const toolCallId = String(raw.tool_call_id ?? "");
+      const toolCallName = toolNames.get(toolCallId);
+      messages.push({ role: "tool", parts, toolCallId, ...(toolCallName ? { toolCallName } : {}) });
     } else if (role === "assistant") {
       messages.push({ role: "assistant", parts, toolCalls: toolCalls.length ? toolCalls : undefined });
     } else {
@@ -577,11 +590,22 @@ function normalizeOpenAI(body: Json): NormRequest {
 /** Normalize an Anthropic messages body. */
 function normalizeAnthropic(body: Json): NormRequest {
   const messages: NormMessage[] = [];
+  const toolNames = new Map<string, string>();
   for (const raw of asArray(body.messages)) {
     if (!isObject(raw)) continue;
-    const parts: NormPart[] = [];
-    const toolCalls: { id: string; name: string; input: unknown }[] = [];
-    let toolCallId: string | undefined;
+    const role = raw.role === "assistant" ? "assistant" : "user";
+    let parts: NormPart[] = [];
+    let toolCalls: { id: string; name: string; input: unknown }[] = [];
+    let pushed = false;
+    // Flush the pending normal message. `force` guarantees one message per
+    // input message when no tool_result split it.
+    const flush = (force: boolean): void => {
+      if (parts.length === 0 && toolCalls.length === 0 && (!force || pushed)) return;
+      messages.push({ role, parts, toolCalls: toolCalls.length ? toolCalls : undefined });
+      parts = [];
+      toolCalls = [];
+      pushed = true;
+    };
     const content = raw.content;
     if (typeof content === "string") {
       if (content) parts.push({ type: "text", text: content });
@@ -602,28 +626,34 @@ function normalizeAnthropic(body: Json): NormRequest {
               },
             });
           } else if (source.type === "url" && typeof source.url === "string") {
-            parts.push({ type: "image", image: { kind: "url", mediaType: "image/png", data: source.url } });
+            parts.push({ type: "image", image: { kind: "url", mediaType: mimeFromUrl(source.url), data: source.url } });
           }
         } else if (block.type === "tool_use") {
-          toolCalls.push({
+          const call = {
             id: String(block.id ?? ""),
             name: String(block.name ?? ""),
             input: block.input ?? {},
-          });
+          };
+          toolCalls.push(call);
+          if (call.id && call.name) toolNames.set(call.id, call.name);
         } else if (block.type === "tool_result") {
-          toolCallId = String(block.tool_use_id ?? "");
+          // One tool message per result: the result id must survive
+          // cross-wire, and a result with text is still a result.
+          flush(false);
           const text = blocksText(block.content);
-          if (text) parts.push({ type: "text", text });
+          const toolCallId = String(block.tool_use_id ?? "");
+          const toolCallName = toolNames.get(toolCallId);
+          messages.push({
+            role: "tool",
+            parts: text ? [{ type: "text", text }] : [],
+            toolCallId,
+            ...(toolCallName ? { toolCallName } : {}),
+          });
+          pushed = true;
         }
       }
     }
-    const role = raw.role === "assistant" ? "assistant" : "user";
-    messages.push({
-      role: toolCallId !== undefined && parts.length === 0 && toolCalls.length === 0 ? "tool" : role,
-      parts,
-      toolCalls: toolCalls.length ? toolCalls : undefined,
-      toolCallId,
-    });
+    flush(true);
   }
   const tools: NormTool[] = [];
   for (const raw of asArray(body.tools)) {
@@ -794,6 +824,27 @@ function buildAnthropicRequest(norm: NormRequest, model: string): Json {
   return body;
 }
 
+function mapToolChoiceToGemini(choice: unknown): Json | null {
+  if (typeof choice === "string") {
+    if (choice === "none") return { mode: "NONE" };
+    if (choice === "required") return { mode: "ANY" };
+    if (choice === "auto") return { mode: "AUTO" };
+    return null;
+  }
+  if (isObject(choice)) {
+    if (choice.type === "any") return { mode: "ANY" };
+    if (choice.type === "none") return { mode: "NONE" };
+    if (choice.type === "auto") return { mode: "AUTO" };
+    if (choice.type === "tool" && typeof choice.name === "string") {
+      return { mode: "ANY", allowedFunctionNames: [choice.name] };
+    }
+    if (choice.type === "function" && isObject(choice.function) && typeof choice.function.name === "string") {
+      return { mode: "ANY", allowedFunctionNames: [choice.function.name] };
+    }
+  }
+  return null;
+}
+
 function buildGeminiRequest(norm: NormRequest): Json {
   const contents: Json[] = [];
   for (const message of norm.messages) {
@@ -816,7 +867,7 @@ function buildGeminiRequest(norm: NormRequest): Json {
     if (message.role === "tool") {
       parts.push({
         functionResponse: {
-          name: message.toolCallId ?? "",
+          name: message.toolCallName ?? message.toolCallId ?? "",
           response: { content: parts.map((p) => p.text ?? "").join("\n") },
         },
       });
@@ -841,8 +892,22 @@ function buildGeminiRequest(norm: NormRequest): Json {
   if (norm.stops.length) generationConfig.stopSequences = norm.stops;
   if (norm.temperature !== null) generationConfig.temperature = norm.temperature;
   if (norm.topP !== null) generationConfig.topP = norm.topP;
-  if (norm.jsonMode) generationConfig.responseMimeType = "application/json";
+  if (norm.jsonMode) {
+    generationConfig.responseMimeType = "application/json";
+    if (norm.jsonSchema !== null && norm.jsonSchema !== undefined) {
+      // OpenAI wraps the schema as {name, schema, ...}; Gemini wants the
+      // schema itself. A bare schema passes through as-is.
+      generationConfig.responseSchema =
+        isObject(norm.jsonSchema) && norm.jsonSchema.schema !== undefined
+          ? norm.jsonSchema.schema
+          : norm.jsonSchema;
+    }
+  }
   if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
+  if (norm.tools.length && norm.toolChoice !== null && norm.toolChoice !== undefined) {
+    const functionCallingConfig = mapToolChoiceToGemini(norm.toolChoice);
+    if (functionCallingConfig) body.toolConfig = { functionCallingConfig };
+  }
   return body;
 }
 
@@ -855,6 +920,20 @@ interface ProviderAnswer {
   inputTokens: number;
   outputTokens: number;
   stop: string;
+  /** Tool calls the provider stopped with, if any. Absent = none. */
+  toolCalls?: { id: string; name: string; input: unknown }[];
+  /** The stop sequence hit, when the provider reports one. */
+  stopSequence?: string | null;
+}
+
+/** Parse an OpenAI tool-call `arguments` string; keep it verbatim if not JSON. */
+function parseToolArguments(raw: unknown): unknown {
+  if (typeof raw !== "string") return raw ?? {};
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return raw;
+  }
 }
 
 function textFromOpenAIContent(content: unknown): string {
@@ -873,25 +952,52 @@ function parseOpenAIResponse(payload: Json): ProviderAnswer | null {
   const first = choices[0];
   if (!isObject(first) || !isObject(first.message)) return null;
   const usage = isObject(payload.usage) ? payload.usage : {};
+  const toolCalls = asArray(first.message.tool_calls)
+    .filter((tc) => isObject(tc) && isObject(tc.function))
+    .map((tc) => {
+      const fn = (tc as Json).function as Json;
+      return {
+        id: asString((tc as Json).id) ?? "",
+        name: asString(fn.name) ?? "",
+        input: parseToolArguments(fn.arguments),
+      };
+    });
   return {
     text: textFromOpenAIContent(first.message.content),
     inputTokens: asNumber(usage.prompt_tokens) ?? 0,
     outputTokens: asNumber(usage.completion_tokens) ?? 0,
     stop: asString(first.finish_reason) ?? "stop",
+    ...(toolCalls.length ? { toolCalls } : {}),
   };
 }
 
 function parseAnthropicResponse(payload: Json): ProviderAnswer | null {
-  const text = asArray(payload.content)
+  // Structural validation, like the other parsers: a 200 with no content
+  // array is a protocol error, not an empty answer.
+  if (!Array.isArray(payload.content)) return null;
+  const blocks = asArray(payload.content);
+  const text = blocks
     .filter((b) => isObject(b) && b.type === "text" && typeof b.text === "string")
     .map((b) => b.text as string)
     .join("");
+  const toolCalls = blocks
+    .filter((b) => isObject(b) && b.type === "tool_use")
+    .map((b) => {
+      const block = b as Json;
+      return {
+        id: asString(block.id) ?? "",
+        name: asString(block.name) ?? "",
+        input: block.input ?? {},
+      };
+    });
   const usage = isObject(payload.usage) ? payload.usage : {};
   return {
     text,
     inputTokens: asNumber(usage.input_tokens) ?? 0,
     outputTokens: asNumber(usage.output_tokens) ?? 0,
     stop: asString(payload.stop_reason) ?? "end_turn",
+    stopSequence: asString(payload.stop_sequence) ?? null,
+    ...(toolCalls.length ? { toolCalls } : {}),
   };
 }
 
@@ -899,16 +1005,26 @@ function parseGeminiResponse(payload: Json): ProviderAnswer | null {
   const candidates = asArray(payload.candidates);
   const first = candidates[0];
   if (!isObject(first) || !isObject(first.content)) return null;
-  const text = asArray(first.content.parts)
+  const parts = asArray(first.content.parts);
+  const text = parts
     .filter((p) => isObject(p) && typeof p.text === "string")
     .map((p) => p.text as string)
     .join("");
+  // Gemini has no call id: use the function name as the id.
+  const toolCalls = parts
+    .filter((p) => isObject(p) && isObject(p.functionCall))
+    .map((p) => {
+      const fc = (p as Json).functionCall as Json;
+      const name = asString(fc.name) ?? "";
+      return { id: name, name, input: fc.args ?? {} };
+    });
   const usage = isObject(payload.usageMetadata) ? payload.usageMetadata : {};
   return {
     text,
     inputTokens: asNumber(usage.promptTokenCount) ?? 0,
     outputTokens: asNumber(usage.candidatesTokenCount) ?? 0,
     stop: asString(first.finishReason) ?? "STOP",
+    ...(toolCalls.length ? { toolCalls } : {}),
   };
 }
 
@@ -918,11 +1034,12 @@ function stopFamily(stop: string): number {
   if (["length", "max_tokens", "MAX_TOKENS"].includes(stop)) return 1;
   if (["tool_calls", "function_call", "tool_use"].includes(stop)) return 2;
   if (["content_filter", "refusal", "SAFETY"].includes(stop)) return 3;
+  if (stop === "stop_sequence") return 4;
   return 0;
 }
 
-const OPENAI_STOPS = ["stop", "length", "tool_calls", "content_filter"];
-const ANTHROPIC_STOPS = ["end_turn", "max_tokens", "tool_use", "refusal"];
+const OPENAI_STOPS = ["stop", "length", "tool_calls", "content_filter", "stop"];
+const ANTHROPIC_STOPS = ["end_turn", "max_tokens", "tool_use", "refusal", "stop_sequence"];
 
 // ---------------------------------------------------------------------------
 // Upstream calls
@@ -967,7 +1084,8 @@ function classifyRefusal(payload: unknown): RefusalKind {
   }
   if (message === null) return "unknown";
   if (message.includes("budget is spent")) return "budget";
-  if (message.endsWith(" is out")) return "outage";
+  // Trailing punctuation must not defeat the outage match ("... is out.").
+  if (message.trim().replace(/[.!?…]+$/, "").endsWith(" is out")) return "outage";
   if (message.includes("refused this call")) return "scheduled";
   return "unknown";
 }
@@ -1060,6 +1178,12 @@ function openAIResponse(
   res: ServerResponse,
 ): void {
   const finishReason = OPENAI_STOPS[stopFamily(answer.stop)];
+  const toolCalls = answer.toolCalls ?? [];
+  const openAIToolCalls = toolCalls.map((tc) => ({
+    id: tc.id,
+    type: "function",
+    function: { name: tc.name, arguments: JSON.stringify(tc.input) },
+  }));
   const usage = {
     prompt_tokens: answer.inputTokens,
     completion_tokens: answer.outputTokens,
@@ -1074,7 +1198,11 @@ function openAIResponse(
       choices: [
         {
           index: 0,
-          message: { role: "assistant", content: answer.text },
+          message: {
+            role: "assistant",
+            content: answer.text,
+            ...(openAIToolCalls.length ? { tool_calls: openAIToolCalls } : {}),
+          },
           finish_reason: finishReason,
           logprobs: null,
         },
@@ -1100,6 +1228,9 @@ function openAIResponse(
   for (const piece of splitText(answer.text, 13)) {
     frames.push({ ...base, choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] });
   }
+  if (openAIToolCalls.length) {
+    frames.push({ ...base, choices: [{ index: 0, delta: { tool_calls: openAIToolCalls }, finish_reason: null }] });
+  }
   frames.push({ ...base, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] });
   frames.push({ ...base, choices: [], usage });
   for (const frame of frames) res.write(`data: ${JSON.stringify(frame)}\n\n`);
@@ -1115,15 +1246,20 @@ function anthropicResponse(
   res: ServerResponse,
 ): void {
   const stopReason = ANTHROPIC_STOPS[stopFamily(answer.stop)];
+  const toolCalls = answer.toolCalls ?? [];
   if (!stream) {
+    const content: Json[] = [{ type: "text", text: answer.text }];
+    for (const tc of toolCalls) {
+      content.push({ type: "tool_use", id: tc.id, name: tc.name, input: tc.input });
+    }
     sendJson(res, 200, {
       id: `msg_agg_${requestSeq}`,
       type: "message",
       role: "assistant",
       model,
-      content: [{ type: "text", text: answer.text }],
+      content,
       stop_reason: stopReason,
-      stop_sequence: null,
+      stop_sequence: answer.stopSequence ?? null,
       usage: { input_tokens: answer.inputTokens, output_tokens: answer.outputTokens },
     });
     return;
@@ -1162,13 +1298,35 @@ function anthropicResponse(
       data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: piece } },
     });
   }
+  events.push({ event: "content_block_stop", data: { type: "content_block_stop", index: 0 } });
+  toolCalls.forEach((tc, i) => {
+    const index = 1 + i;
+    events.push(
+      {
+        event: "content_block_start",
+        data: {
+          type: "content_block_start",
+          index,
+          content_block: { type: "tool_use", id: tc.id, name: tc.name, input: {} },
+        },
+      },
+      {
+        event: "content_block_delta",
+        data: {
+          type: "content_block_delta",
+          index,
+          delta: { type: "input_json_delta", partial_json: JSON.stringify(tc.input) },
+        },
+      },
+      { event: "content_block_stop", data: { type: "content_block_stop", index } },
+    );
+  });
   events.push(
-    { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
     {
       event: "message_delta",
       data: {
         type: "message_delta",
-        delta: { stop_reason: stopReason, stop_sequence: null },
+        delta: { stop_reason: stopReason, stop_sequence: answer.stopSequence ?? null },
         usage: { output_tokens: answer.outputTokens },
       },
     },
@@ -1193,6 +1351,26 @@ function sendUpstreamError(res: ServerResponse, api: "openai" | "anthropic"): vo
   }
 }
 
+/** Error body in the shape of the API the client called. */
+function sendApiError(
+  res: ServerResponse,
+  api: "openai" | "anthropic",
+  status: number,
+  message: string,
+  type: string,
+): void {
+  if (api === "openai") {
+    sendJson(res, status, { error: { message, type } });
+  } else {
+    sendJson(res, status, { type: "error", error: { type, message } });
+  }
+}
+
+/** Which API a request targets, from the raw request-target (safe even when URL parsing failed). */
+function apiForRequest(req: IncomingMessage): "openai" | "anthropic" {
+  return (req.url ?? "").startsWith("/v1/messages") ? "anthropic" : "openai";
+}
+
 // ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
@@ -1207,7 +1385,10 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
         reject(new Error("body too large"));
-        req.destroy();
+        // Pause instead of destroying: the socket must stay open so the
+        // caller can write the 413 response. It destroys the request
+        // once the response has finished.
+        req.pause();
         return;
       }
       chunks.push(chunk);
@@ -1259,15 +1440,19 @@ class Aggregator {
     const auth = req.headers.authorization ?? "";
     const hasBearer = typeof auth === "string" && auth.startsWith("Bearer");
     const hasApiKey = typeof req.headers["x-api-key"] === "string";
+    const firstId = ids.length ? ids[0].id : null;
+    const lastId = ids.length ? ids[ids.length - 1].id : null;
     if (hasApiKey && !hasBearer) {
       sendJson(res, 200, {
         data: ids.map(({ id }) => ({
           type: "model",
           id,
           display_name: id,
-          created_at: "2026-01-01T00:00:00Z",
+          created_at: new Date(CREATED * 1000).toISOString(),
         })),
         has_more: false,
+        first_id: firstId,
+        last_id: lastId,
       });
     } else {
       sendJson(res, 200, {
@@ -1278,6 +1463,8 @@ class Aggregator {
           created: CREATED,
           owned_by: provider,
         })),
+        first_id: firstId,
+        last_id: lastId,
       });
     }
   }
@@ -1303,19 +1490,33 @@ class Aggregator {
     req: IncomingMessage,
     res: ServerResponse,
   ): Promise<void> {
-    await this.enqueue(async () => {
-      const index = this.requestIndex++;
-      const requestSeq = index + 1;
-      let body: Json;
-      try {
-        const raw = await readBody(req);
-        const parsed = JSON.parse(raw.toString("utf8")) as unknown;
-        if (!isObject(parsed)) throw new Error("body is not an object");
-        body = parsed;
-      } catch {
-        sendJson(res, 400, { error: { message: "invalid JSON body", type: "invalid_request_error" } });
+    // Read and parse the body BEFORE joining the serial queue: a
+    // slow-dripping body must not stall requests behind it. The manifest
+    // slot is still assigned inside the queue, in completion order.
+    let body: Json;
+    try {
+      const raw = await readBody(req);
+      const parsed = JSON.parse(raw.toString("utf8")) as unknown;
+      if (!isObject(parsed)) throw new Error("body is not an object");
+      body = parsed;
+    } catch (error) {
+      if (error instanceof Error && error.message === "body too large") {
+        sendApiError(res, api, 413, "body too large", "invalid_request_error");
+        res.on("finish", () => req.destroy());
         return;
       }
+      sendApiError(res, api, 400, "invalid JSON body", "invalid_request_error");
+      return;
+    }
+    if (!Array.isArray(body.messages) || body.messages.length === 0) {
+      sendApiError(res, api, 400, "messages must be a non-empty array", "invalid_request_error");
+      return;
+    }
+    await this.enqueue(async () => {
+      // Assign the manifest slot only once the body parsed: a malformed,
+      // aborted, or oversized request must not consume a slot.
+      const index = this.requestIndex++;
+      const requestSeq = index + 1;
       const norm = api === "openai" ? normalizeOpenAI(body) : normalizeAnthropic(body);
       const stream = body.stream === true;
       const clientAnthropicVersion =
@@ -1386,8 +1587,9 @@ class Aggregator {
   }
 
   handler = (req: IncomingMessage, res: ServerResponse): void => {
-    const url = new URL(req.url ?? "/", "http://localhost");
     try {
+      // Inside the try: a malformed request-target must not kill the process.
+      const url = new URL(req.url ?? "/", "http://localhost");
       if (req.method === "GET" && url.pathname === "/v1/models") {
         this.modelList(req, res);
         return;
@@ -1395,21 +1597,21 @@ class Aggregator {
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
         void this.handleInference("openai", req, res).catch((error: unknown) => {
           log(`openai handler error: ${String(error)}`);
-          if (!res.headersSent) sendJson(res, 500, { error: { message: "internal error" } });
+          if (!res.headersSent) sendApiError(res, "openai", 500, "internal error", "api_error");
         });
         return;
       }
       if (req.method === "POST" && url.pathname === "/v1/messages") {
         void this.handleInference("anthropic", req, res).catch((error: unknown) => {
           log(`anthropic handler error: ${String(error)}`);
-          if (!res.headersSent) sendJson(res, 500, { error: { message: "internal error" } });
+          if (!res.headersSent) sendApiError(res, "anthropic", 500, "internal error", "api_error");
         });
         return;
       }
-      sendJson(res, 404, { error: { message: "not found" } });
+      sendApiError(res, apiForRequest(req), 404, "not found", "not_found_error");
     } catch (error) {
       log(`handler error: ${String(error)}`);
-      if (!res.headersSent) sendJson(res, 500, { error: { message: "internal error" } });
+      if (!res.headersSent) sendApiError(res, apiForRequest(req), 500, "internal error", "api_error");
     }
   };
 }
